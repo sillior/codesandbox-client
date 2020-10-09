@@ -6,7 +6,7 @@ import * as escope from 'escope';
 import { basename } from 'path';
 import { walk } from 'estree-walker';
 import { flatten } from 'lodash-es';
-import { Property } from 'meriyah/dist/estree';
+import { Property, Statement } from 'meriyah/dist/estree';
 import { Syntax as n } from './syntax';
 import {
   generateRequireStatement,
@@ -22,7 +22,9 @@ import { customGenerator } from './generator';
 /**
  * Converts esmodule code to commonjs code, built to be as fast as possible
  */
-export function convertEsModule(code: string) {
+export function convertEsModule(
+  code: string
+): { code: string; ast: meriyah.ESTree.Program } {
   const usedVarNames = {};
   const varsToRename = {};
   const trackedExports = {};
@@ -36,10 +38,20 @@ export function convertEsModule(code: string) {
     return usedName;
   };
 
-  let program = meriyah.parseModule(code, { next: true });
+  let program = meriyah.parseModule(code, {
+    next: true,
+    raw: true,
+    jsx: true,
+  });
 
   let i = 0;
   let importOffset = 0;
+
+  function addNodeInImportSpace(oldPosition: number, node: Statement) {
+    program.body.splice(oldPosition, 1);
+    program.body.splice(importOffset, 0, node);
+    importOffset++;
+  }
 
   let addedSpecifier = false;
   function addEsModuleSpecifier() {
@@ -49,6 +61,10 @@ export function convertEsModule(code: string) {
     addedSpecifier = true;
 
     program.body.unshift(generateEsModuleSpecifier());
+
+    // Make sure imports will stay after this
+    importOffset++;
+
     i++;
   }
 
@@ -113,10 +129,9 @@ export function convertEsModule(code: string) {
         continue;
       }
       const varName = getVarName(`$csb__${basename(source.value, '.js')}`);
+      addNodeInImportSpace(i, generateRequireStatement(varName, source.value));
 
-      program.body[i] = generateRequireStatement(varName, source.value);
-      i++;
-      program.body.splice(i, 0, generateAllExportsIterator(varName));
+      program.body.push(generateAllExportsIterator(varName));
     } else if (statement.type === n.ExportNamedDeclaration) {
       // export { a } from './test';
       // TO:
@@ -157,17 +172,17 @@ export function convertEsModule(code: string) {
             varName
           );
         } else {
-          program.body[i] = generateRequireStatement(varName, source.value);
+          addNodeInImportSpace(
+            i,
+            generateRequireStatement(varName, source.value)
+          );
         }
 
         if (statement.specifiers.length) {
-          i++;
-
-          statement.specifiers
-            .reverse()
-            .forEach((specifier: meriyah.ESTree.ExportSpecifier) => {
+          statement.specifiers.forEach(specifier => {
+            if (specifier.type === n.ExportSpecifier) {
               program.body.splice(
-                i,
+                importOffset++,
                 0,
                 generateExportGetter(
                   { type: n.Literal, value: specifier.exported.name },
@@ -184,7 +199,19 @@ export function convertEsModule(code: string) {
                   }
                 )
               );
-            });
+            } else if (specifier.type === n.ExportNamespaceSpecifier) {
+              program.body.splice(
+                importOffset++,
+                0,
+                generateExportGetter(
+                  { type: n.Literal, value: specifier.specifier.name },
+                  { type: n.Identifier, name: varName }
+                )
+              );
+            }
+
+            i++;
+          });
         }
       } else if (statement.declaration) {
         // First remove the export statement
@@ -259,10 +286,7 @@ export function convertEsModule(code: string) {
             program.body.unshift(
               generateExportGetter(
                 { type: n.Literal, value: specifier.exported.name },
-                {
-                  type: n.Identifier,
-                  name: specifier.local.name,
-                }
+                { type: n.Identifier, name: specifier.local.name }
               )
             );
           }
@@ -348,15 +372,7 @@ export function convertEsModule(code: string) {
       }
       const varName = getVarName(`$csb__${basename(source.value, '.js')}`);
 
-      // Remove this statement
-      program.body.splice(i, 1);
-      // Create require statement instead of the import
-      program.body.splice(
-        importOffset,
-        0,
-        generateRequireStatement(varName, source.value)
-      );
-      importOffset++;
+      addNodeInImportSpace(i, generateRequireStatement(varName, source.value));
 
       statement.specifiers.reverse().forEach(specifier => {
         let localName: string;
@@ -511,5 +527,5 @@ export function convertEsModule(code: string) {
     generator: customGenerator,
   });
 
-  return `"use strict";\n${finalCode}`;
+  return { code: `"use strict";\n${finalCode}`, ast: program };
 }
